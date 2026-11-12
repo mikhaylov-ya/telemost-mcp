@@ -82,12 +82,21 @@ def message_view(server_message: dict) -> dict:
     })
 
 
-def chat_view(chat: dict) -> dict:
+def chat_space(chat: dict, spaces: list[dict]) -> str:
+    """The space a chat belongs to, as the web client groups them: an organization listed in the chat's
+    `OrganizationIds` (`ChatInfo` of a group or business chat, else `PrivateChatInfo`), otherwise `external`."""
+    info = chat.get("ChatInfo") or chat.get("PrivateChatInfo") or {}
+    names = {space["id"]: space["name"] for space in spaces}
+    return next((names[org] for org in info.get("OrganizationIds") or [] if org in names), names.get(0, "external"))
+
+
+def chat_view(chat: dict, space: str | None = None) -> dict:
     info = chat.get("ChatInfo") or {}
     partner = chat.get("PartnerInfo") or {}
     return compact({
         "chat_id": chat["ChatId"],
         "name": info.get("Name") or partner.get("DisplayName") or chat["ChatId"],
+        "space": space,
         "kind": "private" if partner else "group",
         "description": info.get("Description"),
         "members": info.get("MemberCount"),

@@ -41,6 +41,9 @@ API_HEADERS = {
 # The web client writes 5 into byte 0 of this header and leaves the rest empty.
 PAYLOAD_HEADER = b"\x05" + bytes(11)
 DATA, PROXY_STATUS = 1, 2
+# Chats outside every organization of the user. The web client shows them as the space «Внешние чаты»
+# and sends organization id 0 for it; server-side search only returns chats of the space in the header.
+EXTERNAL = {"id": 0, "name": "external"}
 
 
 class TelemostError(RuntimeError):
@@ -140,12 +143,17 @@ class Telemost:
         self.http = httpx.AsyncClient(headers=API_HEADERS, timeout=30)
         self.me: dict | None = None
         self.xiva: Xiva | None = None
+        self.spaces: list[dict] = []
         self.lock = asyncio.Lock()
 
-    async def api(self, method: str, **params) -> dict:
-        headers = {"X-Request-Id": str(uuid.uuid4()), "X-Request-Attempt": "0", "Cookie": cookie_header()}
-        if self.me:
-            headers |= {"X-Uid": str(self.me["uid"]), "X-Ya-Organization-Id": str(self.me["organization_id"])}
+    async def api(self, method: str, org: int | None = None, **params) -> dict:
+        """`org` picks the space: an organization id or 0 for external chats. Only `search` depends on it."""
+        await self.session()  # Without X-Ya-Organization-Id the server takes the external space.
+        org = self.me["organization_id"] if org is None else org
+        headers = {
+            "X-Request-Id": str(uuid.uuid4()), "X-Request-Attempt": "0", "Cookie": cookie_header(),
+            "X-Uid": str(self.me["uid"]), "X-Ya-Organization-Id": str(org),
+        }
         request = json.dumps({"method": method, "params": params})
         response = await self.http.post(API_URL, files={"request": (None, request)}, headers=headers)
         response.raise_for_status()
@@ -154,24 +162,41 @@ class Telemost:
             raise TelemostError(f"{method} failed: {body}")
         return body["data"]
 
-    async def fanout(self, method: str, body: dict) -> dict:
+    async def session(self) -> None:
         async with self.lock:
             if self.xiva is None or not self.xiva.alive:
                 await self.login()
+
+    async def fanout(self, method: str, body: dict) -> dict:
+        await self.session()
         return await self.xiva.call(method, body)
 
     async def login(self) -> None:
         cookie = cookie_header()
         # Session_id lists the logged-in accounts as `|<uid>.`; the first one is the default account.
-        self.xiva = Xiva(cookie, int(re.search(r"Session_id=[^;]*?\|(\d+)\.", cookie).group(1)))
-        await self.xiva.connect()
+        xiva = Xiva(cookie, int(re.search(r"Session_id=[^;]*?\|(\d+)\.", cookie).group(1)))
+        await xiva.connect()  # Kept only once connected: a failed attempt must not leave a socket without a reader.
+        self.xiva = xiva
         info = (await self.xiva.call("whoami", {}))["UserInfo"]
-        organizations = info.get("OrganizationInfos") or [{}]
+        infos = info.get("OrganizationInfos") or []
+        # As in the web client: chats of a public organization fall into the external space,
+        # and a disabled entry without an id switches that space off.
+        closed = any(o.get("Disabled") for o in infos if not o.get("OrganizationId"))
+        organizations = [
+            o for o in infos
+            if o.get("OrganizationId") and not o.get("IsPublic") and not (closed and o.get("Disabled"))
+        ]
+        self.spaces = [
+            {"id": o["OrganizationId"], "name": o.get("OrganizationName") or str(o["OrganizationId"])}
+            for o in organizations
+        ] + ([] if closed else [EXTERNAL])
+        first = organizations[0] if organizations else {}
         self.me = {
             "uid": info["Uid"],
             "guid": info["Guid"],
             "name": info.get("DisplayName"),
             "email": info.get("Email"),
-            "organization_id": organizations[0].get("OrganizationId", 0),
-            "organization": organizations[0].get("OrganizationName"),
+            "organization_id": first.get("OrganizationId", 0),
+            "organization": first.get("OrganizationName"),
+            "spaces": self.spaces,
         }
