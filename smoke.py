@@ -41,6 +41,9 @@ async def main(chat_query: str) -> None:
         await step("users_get", server.users_get, guids)
         word = next((w for m in page for w in m.get("text", "").split() if len(w) > 4), "привет")
         await step(f"messages_search '{word}'", server.messages_search, word, chat_id, limit=3)
+        await step(f"messages_search '{word}' (all spaces)", server.messages_search, word, limit=3)
+    if target.get("space"):
+        await step(f"chats_list (space {target['space']})", server.chats_list, space=target["space"], limit=3)
     await step("sync (1 day)", server.sync, chat_id, days=1)
     if page:
         await step(f"local_search '{word}'", server.local_search, word, limit=3)

@@ -11,10 +11,11 @@ import time
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from telemost_mcp.client import Telemost
 from telemost_mcp.store import Store
-from telemost_mcp.views import chat_view, iso, message_view, thread_id, to_mcs, user_view
+from telemost_mcp.views import chat_space, chat_view, iso, message_view, thread_id, to_mcs, user_view
 
 mcp = MCPServer(
     "telemost",
@@ -22,6 +23,8 @@ mcp = MCPServer(
         "Read-only access to the user's Yandex Telemost work chats. "
         "Find a chat_id with chats_list, then read it with messages_get or search it with messages_search. "
         "Messages that start a thread carry `thread` and inline `replies`; page long threads with thread_get. "
+        "Chats are grouped into spaces as in the web client: each organization of the user and `external` "
+        "(chats outside them). Tools cover all spaces unless `space` narrows them; chats and hits carry `space`. "
         "Timestamps are ISO 8601 in local time."
     ),
 )
@@ -37,6 +40,24 @@ PAGE = 50
 async def all_chats() -> list[dict]:
     history = await client.fanout("history", {"Limit": 1, "ChatDataFilter": {}, "MinTimestamp": 0})
     return sorted(history["Chats"], key=lambda c: c.get("LastTsMcs", 0), reverse=True)
+
+
+async def spaces(space: str | int | None = None) -> list[dict]:
+    """All spaces, or the one `space` names: an organization name or id, or `external` (id 0)."""
+    await client.session()
+    if space in (None, ""):
+        return client.spaces
+    key = str(space).strip().lower()
+    found = [s for s in client.spaces if key in (str(s["id"]), s["name"].lower())]
+    if not found:
+        raise ToolError(f"Unknown space {space!r}. Spaces: {', '.join(s['name'] for s in client.spaces)}")
+    return found
+
+
+async def chat_views(space: str | int | None = None) -> list[dict]:
+    wanted = {s["name"] for s in await spaces(space)}
+    views = [chat_view(c, chat_space(c, client.spaces)) for c in await all_chats()]
+    return [v for v in views if v["space"] in wanted]
 
 
 async def history_page(chat_id: str, before_mcs: int | None, limit: int) -> tuple[list[dict], dict]:
@@ -72,15 +93,18 @@ async def fetch_since(chat_id: str, since_mcs: int) -> list[dict]:
 
 @mcp.tool()
 async def whoami() -> dict:
-    """The logged-in user: name, email, uid, guid and organization."""
+    """The logged-in user: name, email, uid, guid, organization and the spaces their chats are grouped into."""
     await client.fanout("whoami", {})
     return client.me
 
 
 @mcp.tool()
-async def chats_list(query: str | None = None, limit: int = 50) -> list[dict]:
-    """Chats sorted by last activity. `query` filters by a case-insensitive substring of the chat name."""
-    chats = [chat_view(c) for c in await all_chats()]
+async def chats_list(query: str | None = None, space: str | int | None = None, limit: int = 50) -> list[dict]:
+    """Chats sorted by last activity. `query` filters by a case-insensitive substring of the chat name.
+
+    `space` keeps one space: an organization name or `external` (see `spaces` in whoami).
+    """
+    chats = await chat_views(space)
     if query:
         chats = [c for c in chats if query.lower() in c["name"].lower()]
     return chats[:limit]
@@ -128,18 +152,32 @@ async def thread_get(thread_id: str, before: int | str | None = None, limit: int
 
 
 @mcp.tool()
-async def messages_search(query: str, chat_id: str | None = None, limit: int = 50) -> list[dict]:
-    """Server-side search over the whole history, in one chat or, without `chat_id`, in all chats.
+async def messages_search(
+    query: str, chat_id: str | None = None, space: str | int | None = None, limit: int = 50
+) -> list[dict]:
+    """Server-side search over the whole history, in one chat or, without `chat_id`, in all chats, newest first.
 
+    Without `chat_id` the server searches one space per request, so every space is searched (or the one
+    `space` names) and the hits are merged; each hit carries its `space`.
     Words match only in the exact form given, so search each likely form separately (релиз, релизы, релиза).
-    The server returns at most 50 hits; narrow a crowded query with `chat_id`.
+    Returns the newest `limit` hits; narrow a crowded query with `chat_id` or `space`.
     """
+    # Search inside one chat ignores the space, so a single request does.
+    targets = [None] if chat_id else await spaces(space)
     scope = {"chat_id": chat_id} if chat_id else {}
-    result = await client.api("search", query=query, limit=limit, entities=["messages"], **scope)
-    return [
-        message_view(hit["data"]) | {"matches": hit.get("matches", {}).get("text")}
-        for hit in result["messages"]["items"]
-    ]
+
+    async def search(target: dict | None) -> list[dict]:
+        org = target["id"] if target else None
+        result = await client.api("search", org=org, query=query, limit=limit, entities=["messages"], **scope)
+        extra = {"space": target["name"]} if target else {}
+        return [
+            message_view(hit["data"]) | extra | {"matches": hit.get("matches", {}).get("text")}
+            for hit in result["messages"]["items"]
+        ]
+
+    # A chat shared by two organizations of the user is found in both spaces.
+    hits = {(h.get("chat_id"), h["ts_mcs"]): h for found in await asyncio.gather(*map(search, targets)) for h in found}
+    return sorted(hits.values(), key=lambda m: m["ts_mcs"], reverse=True)[:limit]
 
 
 @mcp.tool()
@@ -149,15 +187,20 @@ async def users_get(guids: list[str]) -> list[dict]:
 
 
 @mcp.tool()
-async def sync(chat_id: str | None = None, days: int = 7) -> dict:
+async def sync(chat_id: str | None = None, days: int = 7, space: str | int | None = None) -> dict:
     """Load the last `days` of history, thread replies included, for `local_search`.
 
-    Without `chat_id` it loads every chat and thread that had activity in that period.
-    The loaded copy lasts for this session only.
+    Without `chat_id` it loads every chat and thread that had activity in that period, in all spaces
+    or in the one `space` names. The loaded copy lasts for this session only.
     """
     since = int((time.time() - days * 86400) * 1e6)
+    wanted = {s["name"] for s in await spaces(space)}
     chats = await all_chats()
-    names = {c["ChatId"]: chat_view(c)["name"] for c in chats if not chat_id or c["ChatId"] == chat_id}
+    names = {
+        c["ChatId"]: chat_view(c)["name"]
+        for c in chats
+        if (c["ChatId"] == chat_id if chat_id else chat_space(c, client.spaces) in wanted)
+    }
     # A thread id is `<prefix>_<parent ts>`; the prefix maps the thread back to its chat.
     chat_of_prefix = {thread_id(cid, 0).rsplit("_", 1)[0]: cid for cid in names}
     # A late reply under an old message does not move the chat's LastTsMcs, so threads are listed separately.
